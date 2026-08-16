@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.24-00ADD8.svg)](go.mod)
 
-**[Higress](https://higress.cn) AI 网关的预算感知降级插件 —— 在请求发出之前主动切到更便宜的模型，而不是等钱花完了再用 429 把用户挡在门外。**
+**[Higress](https://higress.cn) AI 网关的预算感知降级插件 —— 在请求转发前依据实时预算水位主动切换至成本更低的模型，替代预算耗尽后以 429 拒绝请求的处置方式。**
 
 [English](README.md) · [技术方案](docs/design.md) · [main.go 逐行解读](docs/code-walkthrough.md)
 
