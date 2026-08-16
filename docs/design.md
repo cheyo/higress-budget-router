@@ -7,11 +7,9 @@
 
 ---
 
-## 0. 先纠正一个关键前提：priority 的方向反了
+## 0. 插件执行位置：phase 与 priority
 
-原始设想里写的是「自研插件 priority < 100，跑在所有原生插件之前」。这个方向是**反的**。
-
-Higress 官方文档原文：**「在相同 phase 情况下，priority 值越大，插件在插件链位置越靠前」**。也就是说 **priority 越大越先执行**。
+Higress 的插件链排序规则，官方文档原文：**「在相同 phase 情况下，priority 值越大，插件在插件链位置越靠前」**。即 **priority 越大越先执行**。
 
 对照现网内置插件的实际取值（取自 Higress 主仓各插件 README 的「插件执行优先级」）：
 
@@ -24,7 +22,7 @@ Higress 官方文档原文：**「在相同 phase 情况下，priority 值越大
 | `ai-statistics` | DEFAULT | 250 | 统计埋点 |
 | `ai-proxy` | DEFAULT | 100 | 协议转换 + 上游 Fallback |
 
-若按原设想配成 `priority: 90`，插件会跑在 `ai-proxy`（100）**之后**——那时请求早就被协议转换并转发出去了，改写 `model` 完全不生效，同时 429 也早已由 `ai-token-ratelimit` 抢先返回，主动降级形同虚设。
+本插件的位置由两条硬约束决定：改写必须早于 `ai-proxy`（100），因为请求一旦进入 `ai-proxy` 就已完成协议转换并转发，此时改 `model` 不再生效；也必须早于 `ai-token-ratelimit`（600），否则 429 会抢在主动降级之前返回，降级形同虚设。
 
 **结论：本插件配 `phase: UNSPECIFIED_PHASE`（默认阶段）+ `priority: 800`。**
 
@@ -34,7 +32,7 @@ Higress 官方文档原文：**「在相同 phase 情况下，priority 值越大
 2. 落在 DEFAULT 阶段而非 AUTHN，是为了让 AUTHN 阶段的认证插件（`key-auth` / `jwt-auth` / `oauth`）先跑完，本插件才能直接读到 `x-mse-consumer` 作为租户标识；
 3. `model-router`（AUTHN 900）也已执行完毕，路由头已经存在，本插件改写 model 时**同步覆盖该头**即可，语义清晰。
 
-### 0.1 顺带纠正：响应阶段的顺序是反的
+### 0.1 响应阶段的执行顺序
 
 Envoy filter chain 里 decoder（请求）按链序执行，encoder（响应）**逆序**执行。所以：
 
@@ -45,9 +43,9 @@ Envoy filter chain 里 decoder（请求）按链序执行，encoder（响应）*
 
 ---
 
-## 1. 四层防护的准确表述
+## 1. 四层防护
 
-修正后，四层防护是这样的：
+在上述执行顺序下，四层防护是这样的：
 
 ```
                     请求方向 ──────────────────────────────────────►
