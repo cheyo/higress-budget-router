@@ -1,0 +1,20 @@
+# 编译产物
+main.wasm
+plugin.wasm
+*.wasm
+/dist/
+/bin/
+
+# Go
+*.test
+*.out
+/vendor/
+go.work
+go.work.sum
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~

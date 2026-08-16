@@ -1,0 +1,31 @@
+run:
+  timeout: 5m
+  # 插件的编译目标是 wasm，lint 也按这个目标跑，避免平台相关的误报
+  build-tags: []
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - gofmt
+    - goimports
+
+linters-settings:
+  errcheck:
+    # 这些调用的 error 是刻意忽略的（header 不存在、响应已发出等），
+    # 源码里统一用 `_ =` 显式标注
+    check-blank: false
+  misspell:
+    locale: US
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+  max-issues-per-linter: 0
+  max-same-issues: 0

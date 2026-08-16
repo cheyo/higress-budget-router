@@ -1,0 +1,52 @@
+# 场景二：灰度观察（强烈建议作为第一次上线的配置）
+#
+# dry_run: true 会完整走一遍决策链——查水位、匹配档位、判断是否更便宜——
+# 但最后一步不改写请求，也不拒绝任何流量。
+#
+# 观察这两件事，1~3 天后再决定阈值：
+#   1. budget_level 的分布：warn/degrade 各占多少？exhausted 出现过吗？
+#   2. 日志里 "[dry-run]: would degrade X -> Y" 的频次和模型对
+#
+# 注意：dry_run 期间 budget_degraded 恒为 false（如实反映"实际没改"），
+#       但响应阶段的 Redis 扣减【照常执行】，所以水位是真实的。
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: higress-budget-router
+  namespace: higress-system
+spec:
+  phase: UNSPECIFIED_PHASE
+  priority: 800
+  url: oci://ghcr.io/cheyo/higress-budget-router:0.1.0
+  defaultConfigDisable: true
+  matchRules:
+    - ingress:
+        - higress-system/llm-gateway
+      configDisable: false
+      config:
+        rule_name: tenant-daily-budget
+
+        redis:
+          service_name: redis.dns
+          service_port: 6379
+          timeout: 1000
+
+        tenant_source:
+          type: consumer
+
+        budget_period: 86400
+        quota: 200
+
+        degrade_levels:
+          - { name: warn,      threshold: 0.50, model: qwen-plus }
+          - { name: degrade,   threshold: 0.20, model: deepseek-v3 }
+          - { name: exhausted, threshold: 0.0,  reject: true }
+
+        model_prices:
+          gpt-4o:      { input: 2.5,  output: 10 }
+          qwen-plus:   { input: 0.8,  output: 2 }
+          deepseek-v3: { input: 0.14, output: 0.28 }
+
+        dry_run: true             # ← 灰度开关
+        fail_open: true
+        record_attribute: true

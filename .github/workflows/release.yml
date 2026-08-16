@@ -1,0 +1,64 @@
+name: Release
+
+# 打 tag 时构建 wasm 并推送 OCI 镜像到 ghcr.io。
+# Higress 的 WasmPlugin.spec.url 直接引用它：
+#   url: oci://ghcr.io/<owner>/higress-budget-router:0.1.0
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Build wasm
+        run: GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o main.wasm ./
+
+      - name: Derive version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push OCI image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Higress 从 OCI 镜像根路径读 plugin.wasm，单平台即可
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: main.wasm
+          generate_release_notes: true
+          body: |
+            OCI image:
+            ```
+            oci://ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+            ```

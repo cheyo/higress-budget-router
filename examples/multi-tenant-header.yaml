@@ -1,0 +1,73 @@
+# 场景三：按自定义请求头分租户 + 多套预算策略
+#
+# 适用于网关前面已经有 BFF/业务网关做过身份识别，直接透传 x-tenant-id 的架构；
+# 也适用于不想引入 key-auth 的场景。
+#
+# 这里演示同一个插件对两条 ingress 用不同配置：
+#   - 生产 ingress：预算紧、降级激进
+#   - 内部测试 ingress：预算宽松、只降不拒
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: higress-budget-router
+  namespace: higress-system
+spec:
+  phase: UNSPECIFIED_PHASE
+  priority: 800
+  url: oci://ghcr.io/cheyo/higress-budget-router:0.1.0
+  defaultConfigDisable: true
+  matchRules:
+    # ---------- 生产流量 ----------
+    - ingress:
+        - higress-system/llm-prod
+      configDisable: false
+      config:
+        rule_name: prod-tenant-budget
+        redis:
+          service_name: redis.dns
+          service_port: 6379
+          timeout: 1000
+          database: 0
+        tenant_source:
+          type: header
+          key: x-tenant-id
+        budget_period: 86400
+        quota: 500
+        degrade_levels:
+          - { name: warn,      threshold: 0.40, model: qwen-plus }
+          - { name: degrade,   threshold: 0.15, model: deepseek-v3 }
+          - { name: exhausted, threshold: 0.0,  reject: true }
+        model_prices:
+          gpt-4o:            { input: 2.5,  output: 10 }
+          claude-sonnet-4-5: { input: 3,    output: 15 }
+          qwen-plus:         { input: 0.8,  output: 2 }
+          deepseek-v3:       { input: 0.14, output: 0.28 }
+        rejected_code: 429
+        rejected_message: '{"error":{"code":"budget_exhausted","message":"本租户今日 AI 预算已用尽，请联系管理员或等待次日重置"}}'
+        fail_open: true
+
+    # ---------- 内部测试流量：只降级，永不拒绝 ----------
+    - ingress:
+        - higress-system/llm-internal
+      configDisable: false
+      config:
+        rule_name: internal-tenant-budget
+        redis:
+          service_name: redis.dns
+          service_port: 6379
+          timeout: 1000
+          database: 0
+        tenant_source:
+          type: header
+          key: x-tenant-id
+        budget_period: 604800     # 一周
+        quota: 100
+        degrade_levels:
+          # 没有 reject 档 —— 预算见底也只是一直用最便宜的模型
+          - { name: warn,    threshold: 0.30, model: qwen-turbo }
+          - { name: degrade, threshold: 0.05, model: deepseek-v3 }
+        model_prices:
+          gpt-4o:      { input: 2.5,  output: 10 }
+          qwen-turbo:  { input: 0.3,  output: 0.6 }
+          deepseek-v3: { input: 0.14, output: 0.28 }
+        fail_open: true

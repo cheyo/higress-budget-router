@@ -1,0 +1,60 @@
+# 场景一：最简单租户日预算
+# 按 key-auth 认证出来的 consumer 分租户，日预算 200 单位，两级降级 + 耗尽拒绝。
+#
+# ⚠️ priority 800 —— Higress 中值越大越先执行，必须大于
+#    ai-quota(750) / ai-token-ratelimit(600) / ai-proxy(100)
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: higress-budget-router
+  namespace: higress-system
+spec:
+  phase: UNSPECIFIED_PHASE
+  priority: 800
+  url: oci://ghcr.io/cheyo/higress-budget-router:0.1.0
+  defaultConfigDisable: true
+  matchRules:
+    - ingress:
+        - higress-system/llm-gateway
+      configDisable: false
+      config:
+        rule_name: tenant-daily-budget
+
+        redis:
+          service_name: redis.dns
+          service_port: 6379
+          timeout: 1000
+
+        tenant_source:
+          type: consumer          # 读 x-mse-consumer，需要 AUTHN 阶段有 key-auth
+
+        budget_period: 86400      # 一天
+        quota: 200                # 200 元/天
+
+        degrade_levels:
+          - { name: warn,      threshold: 0.30, model: qwen-plus }
+          - { name: degrade,   threshold: 0.10, model: deepseek-v3 }
+          - { name: exhausted, threshold: 0.0,  reject: true }
+
+        model_prices:             # 每百万 Token 的价格
+          gpt-4o:      { input: 2.5,  output: 10 }
+          qwen-plus:   { input: 0.8,  output: 2 }
+          deepseek-v3: { input: 0.14, output: 0.28 }
+        default_price: { input: 1, output: 1 }
+
+        fail_open: true
+        record_attribute: true
+
+---
+# Redis 服务注册（若尚未注册）
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: default
+  namespace: higress-system
+spec:
+  registries:
+    - name: redis
+      type: dns
+      domain: redis-master.default.svc.cluster.local
+      port: 6379
