@@ -6,7 +6,7 @@
 - 不需要 TinyGo —— Higress 从 2.0 起用标准 Go 的 wasip1 后端
 
 ```bash
-git clone https://github.com/cheyo/higress-budget-router.git
+git clone https://github.com/OWNER/higress-budget-router.git
 cd higress-budget-router
 make build          # go test + vet + wasm 编译
 ```
@@ -32,14 +32,13 @@ make build          # go test + vet + wasm 编译
 
 **错误处理的默认方向是 fail-open**。这个插件跑在所有流量的关键路径上，降级失败的后果是多花点钱，而插件自身出错导致请求中断的后果是业务故障。除非有明确理由，新增分支时优先放行。
 
-**特别注意类型断言**。`ctx.GetContext` 返回 `interface{}`，断言失败会拿到零值。`remain` 的零值 `0.0` 恰好意味着「预算耗尽」——所以 L177 那样的 `ok` 检查不能省，否则「插件出点小问题」会变成「全量 429」。新增从 ctx 取值的代码时请照此办理。
+**特别注意类型断言**。`ctx.GetContext` 返回 `interface{}`，断言失败会拿到零值。`remain` 的零值 `0.0` 恰好意味着「预算耗尽」，所以从 ctx 取值时必须检查 `ok`，避免异常路径被误判成全量 429。
 
-**改动观测字段要谨慎**。`budget_*` 系列属性一旦上了看板，下游的查询、告警规则都会依赖字段名。改名等同于破坏性变更，请在 CHANGELOG 里标注。
+**改动观测字段要谨慎**。`budget_*` 系列属性一旦上了看板，下游的查询、告警规则都会依赖字段名。改名等同于破坏性变更，请在 README 和相关 docs 中明确说明。
 
 ## 提交前
 
 ```bash
-go mod tidy
 make build
 ```
 
@@ -48,8 +47,8 @@ CI 会检查 `go.mod` 是否 tidy、测试是否通过、`GOOS=wasip1` 下 vet �
 ## 提交 PR
 
 - 一个 PR 做一件事
-- 涉及行为变更的，同步更新 `README.md` / `README_zh-CN.md` 的配置表和 `CHANGELOG.md`
-- 修复 `docs/known-issues.md` 里的条目时，请在 PR 描述里引用编号，并从该文件中移除对应条目
+- 涉及行为变更的，同步更新 `README.md` / `README_zh-CN.md` 和相关 docs
+- 如果改变当前限制或验证步骤，同步更新 `docs/known-issues.md` / `docs/production-verification.md`
 
 ## 报 Bug
 

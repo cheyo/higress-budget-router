@@ -1,147 +1,34 @@
-# Known Issues — v0.1
+# 当前限制与生产前验证项
 
-逐行核对 `main.go` 时发现的问题清单。按严重程度排序。行号对应 v0.1 的 `main.go`。
+本文只记录当前版本需要使用者知道的限制和上线前必须确认的事项。
 
-建议开源后把 §0、§1 和 §4 转成 GitHub Issue 跟踪。
+## 1. 当前限制
 
----
+- **接口覆盖范围**：默认只处理 `/completions`、`/messages`、`/responses`、`/generateContent` 这几类 chat/generation 路径。`/embeddings`、`/rerank`、`/moderations` 等接口默认不参与预算统计。
+- **请求体类型**：当前只支持 JSON 请求体的模型改写和计费链路。非 JSON、multipart、音频上传等请求不会被安全改写，也不建议纳入同一条预算规则。
+- **计费依赖 usage**：插件按上游响应里的 `usage` 字段计算 input/output token 成本。上游不返回 usage 时，本次请求不会扣减预算。
+- **响应压缩需实测**：如果上游或网关对 LLM 响应启用 `content-encoding`，需要确认 Proxy-Wasm 响应体 Hook 仍能读取 usage；否则可能漏账。
+- **能力兼容由配置保证**：插件运行时不检查请求里是否使用 tools、vision、audio、json schema 等能力。请通过 `traffic_profile` 和 `model_capabilities` 在配置生效时校验降级目标是否能承接该路由的流量。
+- **路由重选需验证**：插件会在请求体阶段改写模型字段和 `x-higress-llm-model` 路由头。目标 Higress 版本必须验证该改写能触发正确上游选择。
 
-## 0. 【实测确认】请求体阶段改写路由头必定失败
+## 2. 生产前必须验证
 
-**位置**：`main.go` L244–L248
-
-这条原本挂在「待实测」清单里（见 [`design.md`](design.md) §10 第 1 条），
-2026-08-17 在 Higress all-in-one 2.1.0 + Envoy 上实测有了明确结论：**改不了，每次都失败**。
-
-网关日志（`/var/log/higress/gateway.log`，需先把 wasm 日志级别调到 debug）：
-
-```
-error … ai-budget-router: replace routing header x-higress-llm-model failed:
-        error status returned by host: bad argument
-```
-
-**根因**：`onHttpRequestBody` 执行时请求头早已流过 header filter chain，
-proxy-wasm 宿主此时不再接受 `ReplaceHttpRequestHeader`，直接返回 `BadArgument`。
-这不是 Higress 的版本差异，是 proxy-wasm ABI 的阶段约束。
-
-**影响分级**：
-
-- 模型改写本身**不受影响**——body 里的 `model` 字段照常被 sjson 改掉，
-  上游确实收到了降级后的模型（实测 mock 上游侧日志可见 `mock-chat-backup`）；
-- 只要下游按 **body 里的 model** 做协议转换（`ai-proxy` 就是这么做的），链路完全正常；
-- **但**如果不同模型配了**不同 Route / 不同上游服务**、且路由匹配依赖
-  `x-higress-llm-model` 这个头，那么降级后请求仍会走原模型的 Route——
-  body 改了、路由没改，两者不一致。
-
-**当前表现是"静默失败 + 一行 error 日志"**：L246 只记日志不中断，
-降级照常上报成功（`budget_degraded=true`），运维从日志属性上看不出路由头没改成。
-
-**修复方向**（三选一，按代价排序）：
-
-1. 认账：把 `model_to_header` 的默认值改成空串，文档里写明"本插件不改路由头"，
-   同时删掉 L244–L248 那段代码——避免每次降级都刷一条 error 日志；
-2. 提前到 header 阶段：在 `onHttpRequestHeaders` 里就完成决策与改头。
-   代价是拿不到 body 里的 model（只能依赖 `model-router` 写的头），
-   且 AUTHN 阶段的 `x-mse-consumer` 与 priority 排序要重新权衡；
-3. 至少让失败可见：改头失败时把 `budget_degraded` 或新增一个
-   `budget_header_rewrite_failed` 属性如实写进日志，别让它静默。
-
----
-
-## 1. 【功能缺陷】非 JSON 请求体完全不计费
-
-**位置**：`main.go` L108–L113 与 L273–L276
-
-L110-111 的代码注释和 `design.md` §5 都写着「非 JSON body → 跳过改写，**响应阶段仍正常扣减**」。实际做不到：
-
-1. L112 走 `skip()` 返回时，`budgetKey` 还没有被计算（它在 L122，在这个 return 之后）
-2. 响应阶段 L273 `GetStringContext(ctxKeyBudgetKey, "")` 拿到空串 → L274 直接 return，**不扣减**
-
-**影响**：走 multipart 的接口（`/audio/transcriptions`、文件上传等）消耗的 Token 完全不计入预算。这类流量占比高时，水位会系统性偏低，降级永远不触发——插件看起来在跑，实际形同虚设。
-
-**根因**：`ctxKeySkip` 这一个标志把「不改写请求」和「不参与计费」两件不同的事混在了一起。
-
-**修复方向**：
-- 把租户解析和 `budgetKey` 构造（L115–L124）提到 content-type 检查之前
-- 引入独立的 `ctxKeyNoRewrite` 标志，与 `ctxKeySkip` 区分开
-- 语义变成：`skip` = 这个请求与本插件完全无关（路径不匹配、无 body、租户取不到）；`noRewrite` = 参与计费但不改写
-
----
-
-## 2. 【观测盲区】被拒绝的请求可能丢日志属性
-
-**位置**：`main.go` L204 / L209 与 L313–L319
-
-`record()` 只把属性挂到 ctx，真正落盘靠响应体阶段的 L318 `WriteUserAttributeToLogWithKey`。但 L209 `sendRejected` 之后请求终止，响应体阶段不会执行。
-
-**影响**：`exhausted` 档的请求——恰恰是最需要被看到的那批——在日志里可能缺字段，导致「预算耗尽」这个关键事件无法在看板上统计。
-
-**修复方向**：在 `sendRejected` 之前显式调一次 `ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)`。同样适用于 L160 的 fail-closed 拒绝路径。
-
----
-
-## 3. 【死代码】3 个 ctx key + 2 个响应头常量
-
-| 符号 | 位置 | 状态 |
+| 项 | 目标 | 通过标准 |
 |---|---|---|
-| `ctxKeyUsedMicro` | L53，写于 L151 | 无人读取 |
-| `ctxKeyOriginalModel` | L55，写于 L192 | 无人读取 |
-| `ctxKeyDegraded` | L57，写于 L381 | 无人读取 |
-| `HeaderBudgetRemaining` | L61 | 完全未使用 |
-| `HeaderModelDegraded` | L63 | 完全未使用 |
+| 插件加载 | WasmPlugin 已挂载到目标 Ingress | 网关日志出现预算字段，Redis 能看到扣减 |
+| 模型降级 | 预算水位低于阈值时改写模型 | 上游收到的是降级后的模型 |
+| 路由选择 | 改写路由头后进入目标上游 | 响应和上游日志都指向降级目标 |
+| 预算扣减 | 响应 usage 能写入 Redis | Redis 累计值等于本次成本 |
+| 429 拒绝 | 命中 `reject: true` 档时拒绝 | 返回配置的 `rejected_code` 和错误体 |
+| gzip/压缩 | 响应压缩场景不漏账 | Redis 仍能记录本次 usage 成本 |
+| fallback 计费 | 上游 fallback 后模型归属明确 | `budget_billed_model` 与实际执行模型一致 |
+| 压测 | Redis 与网关容量足够 | 高并发下无大量 Redis 超时或 fail-open |
 
-Go 不会对未使用的**常量**报错（不同于变量和 import），所以这些一路编译通过。
+详细步骤见 [`production-verification.md`](production-verification.md)。
 
-后两个反映的是一个**没做完的设计**：原本要把降级信息通过响应头回传给客户端，让 SDK 能感知「我请求的是 gpt-4o，实际跑的是 qwen-plus」，目前只实现了拒绝场景（L398）。
+## 3. 上线建议
 
-**修复方向**：二选一——
-- 补完：加一个 `onHttpResponseHeaders` Hook，把 `x-higress-budget-remaining` 和 `x-higress-model-degraded` 写进响应头
-- 删掉：留着会让人以为功能已经有了
-
----
-
-## 4. 【边界】quota 极小时除零产生 NaN
-
-**位置**：`main.go` L148，`config/config.go` 的 quota 校验
-
-配置校验只拦了 `quota <= 0`，但 `quota: 0.0000001` 会让 `QuotaMicro = int64(0.1) = 0`，L148 的除法产生 NaN 或 Inf。
-
-L149 的 `math.Max/Min` 对 NaN 无效（`math.Min(1, NaN)` 返回 NaN），NaN 传到 `MatchLevel` 后所有 `<=` 比较都是 false → 不降级。
-
-**影响**：最终是 fail-open，不会造成事故，但属于靠运气兜住而不是靠设计。
-
-**修复方向**：在 `config.Parse` 里把校验从 `quota <= 0` 改成同时校验 `QuotaMicro <= 0`。
-
----
-
-## 5. 【冗余】L200 重复设置 level name
-
-`ctx.SetContext(ctxKeyLevelName, level.Name)` 在 L200 设一次，紧接着 `record()` 内部 L380 又设一次。删掉 L200 即可。
-
----
-
-## 6. 【笔误】两处命名
-
-- **L316 `budget_billed_mode`** → 应为 `budget_billed_model`。这是个会写进访问日志的字段名，**上了看板再改成本很高**（下游查询、告警规则都要跟着改），建议在第一次上线前改掉。
-- **L56 `ctxKeyEffectiveModl`** 少一个 `e`，是为了让 gofmt 的等号对齐更整齐而牺牲了可读性。建议改名 `ctxKeyActualModel`。
-
----
-
-## 7. 【注释与代码不符】isCheaper 的兜底方向
-
-**位置**：`main.go` L366–L374
-
-注释写「目标模型未配置单价时，**保守认为不便宜**，避免误降级」，但 L373 实际 `return true`（允许降级）。
-
-代码的选择是对的——运维在 `degrade_levels` 里显式写了 `model: xxx` 本身就是明确的降级意图，因为漏配一个单价就静默不生效，比允许降级更难排查。**改注释即可，不要改代码。**
-
----
-
-## 待实测（不是缺陷，是需要在你的环境确认的假设）
-
-见 [`design.md`](design.md) §10，摘要：
-
-1. ~~请求体阶段改写路由头能否触发 Envoy 重新选路~~ —— **已实测，见上方 §0：改写调用本身就会失败**。
-2. 本插件（800）与 `ai-token-ratelimit`（600）的预算口径是否要打通。
-3. `ai-proxy` Fallback 触发后，响应体里是否会透传真实模型名。
-4. 高 QPS 下 Redis 连接池是否够用。
+- 首次接入使用 `dry_run: true`，观察日志中的 `budget_level`、`budget_degraded`、`budget_request_bytes`。
+- 确认水位、降级率、Redis 扣减都符合预期后，再切到 `dry_run: false`。
+- `ai-token-ratelimit` 适合作为极限兜底，阈值应比本插件的降级和拒绝策略更宽松。
+- 对 embeddings、rerank、audio、multipart 等流量，建议拆成独立路由和独立预算策略。

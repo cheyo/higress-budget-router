@@ -1,8 +1,14 @@
-# 场景一：最简单租户日预算
-# 按 key-auth 认证出来的 consumer 分租户，日预算 200 单位，两级降级 + 耗尽拒绝。
+# ═══════════════════════════════════════════════════════════════════════════
+# 场景一：最小可用配置（按 consumer 分租户的日预算）
 #
-# ⚠️ priority 800 —— Higress 中值越大越先执行，必须大于
-#    ai-quota(750) / ai-token-ratelimit(600) / ai-proxy(100)
+# 想快速跑起来，只需要改三处：
+#   ① redis.service_name        改成你 McpBridge 注册的 Redis 服务名
+#   ② quota                     改成你的日预算金额
+#   ③ url                       改成你 make push 出来的镜像地址
+# 其余保持原样即可先跑 dry_run。
+#
+# 完整字段说明、校验规则、上线步骤见 docs/user-manual.md
+# ═══════════════════════════════════════════════════════════════════════════
 apiVersion: extensions.higress.io/v1alpha1
 kind: WasmPlugin
 metadata:
@@ -10,40 +16,75 @@ metadata:
   namespace: higress-system
 spec:
   phase: UNSPECIFIED_PHASE
+  # ⚠️ Higress 中 priority 值越大越先执行。必须大于
+  #    ai-quota(750) / ai-token-ratelimit(600) / ai-proxy(100)，
+  #    配小了插件会跑在 ai-proxy 之后，静默不生效。
   priority: 800
-  url: oci://ghcr.io/cheyo/higress-budget-router:0.1.0
+  url: oci://ghcr.io/OWNER/higress-budget-router:0.1.0        # ③ 改这里
   defaultConfigDisable: true
   matchRules:
     - ingress:
         - higress-system/llm-gateway
       configDisable: false
       config:
+        # ── 一、租户与预算 ──────────────────────────────────────────────
         rule_name: tenant-daily-budget
-
         redis:
-          service_name: redis.dns
+          service_name: redis.dns                              # ① 改这里
           service_port: 6379
           timeout: 1000
-
         tenant_source:
-          type: consumer          # 读 x-mse-consumer，需要 AUTHN 阶段有 key-auth
+          type: consumer          # 读 x-mse-consumer，需 AUTHN 阶段有 key-auth
+        budget_period: 86400      # 预算周期（秒）：一天
+        quota: 200                # ② 改这里：周期总预算，单位与 model_prices 一致
 
-        budget_period: 86400      # 一天
-        quota: 200                # 200 元/天
-
-        degrade_levels:
-          - { name: warn,      threshold: 0.30, model: qwen-plus }
-          - { name: degrade,   threshold: 0.10, model: deepseek-v3 }
-          - { name: exhausted, threshold: 0.0,  reject: true }
-
-        model_prices:             # 每百万 Token 的价格
-          gpt-4o:      { input: 2.5,  output: 10 }
-          qwen-plus:   { input: 0.8,  output: 2 }
+        # ── 二、模型单价（计费必需）─────────────────────────────────────
+        # 单位：每【百万】Token 的费用。
+        # 所有降级目标都必须出现在这张表里，否则配置会被拒绝
+        # ——漏配单价会导致计费回落到 default_price，记出一笔假账。
+        model_prices:
+          gpt-4o:      { input: 2.5,  output: 10   }
+          qwen-plus:   { input: 0.8,  output: 2    }
           deepseek-v3: { input: 0.14, output: 0.28 }
         default_price: { input: 1, output: 1 }
 
-        fail_open: true
-        record_attribute: true
+        # ── 三、本 route 的流量特征（运维声明）──────────────────────────
+        # 声明这条 route 上的请求会用到哪些能力。
+        # 插件【不检测请求内容】，完全以此声明为准。
+        # 可选值：tools / vision / audio / json_schema
+        # 宁可多声明——多声明只是少省钱，漏声明会让降级后的请求失败。
+        traffic_profile: [tools]
+
+        # ── 四、模型能力表（可选，但强烈建议填）─────────────────────────
+        # 填了的话，插件会在【配置生效时】校验每个降级目标能否承接
+        # traffic_profile，不满足就拒绝整份配置。零运行时开销。
+        # 不填则退化为完全由运维自负。
+        model_capabilities:
+          gpt-4o:      { tools: true, vision: true,  json_schema: true  }
+          qwen-plus:   { tools: true, vision: false, json_schema: true  }
+          deepseek-v3: { tools: true, vision: false, json_schema: false }
+
+        # ── 五、降级阶梯 ────────────────────────────────────────────────
+        # threshold = 剩余预算比例，升序匹配，取第一条满足的（最严格那档）。
+        # 校验会强制「预算越紧张，目标模型越便宜」，配反了拒绝生效。
+        #
+        # max_request_bytes：请求体超过此大小就不降级（目标模型窗口可能装不下）。
+        #   首次上线【留空】，等 dry_run 拿到数据再回填 —— 怎么算见用户手册。
+        degrade_levels:
+          - name: warn
+            threshold: 0.30
+            model: qwen-plus
+          - name: degrade
+            threshold: 0.10
+            model: deepseek-v3
+          - name: exhausted
+            threshold: 0.0
+            reject: true          # 兜底：直接 429。必须是 threshold 最小的一档
+
+        # ── 六、运行开关 ────────────────────────────────────────────────
+        dry_run: true             # 首次上线固定 true：走完整决策但不真改写
+        fail_open: true           # Redis 异常时放行（可用性优先）
+        record_attribute: true    # 写 AI 访问日志属性，dry_run 期间靠它观察
 
 ---
 # Redis 服务注册（若尚未注册）

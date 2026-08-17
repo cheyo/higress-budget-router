@@ -26,6 +26,9 @@ jobs:
           go mod download
           go mod verify
 
+      - name: Source guards
+        run: make guards
+
       - name: gofmt
         run: |
           out=$(gofmt -l .)

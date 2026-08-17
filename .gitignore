@@ -12,14 +12,15 @@ plugin.wasm
 go.work
 go.work.sum
 
+# 本机 / Agent / 个人操作记录，不上传开源仓库
+CLAUDE.md
+.claude/
+.workbuddy/
+cheyo-doc/
+
 # 编辑器 / 系统
 .idea/
 .vscode/
 .DS_Store
 *.swp
 *~
-
-# 本地联调脚本的中间产物
-test/local/.setup.tmp/
-test/local/.wasmplugin.tmp.yaml
-test/local/mcpbridge.backup.yaml

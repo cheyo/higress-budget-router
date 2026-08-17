@@ -1,14 +1,24 @@
 PLUGIN_NAME ?= higress-budget-router
 VERSION     ?= $(shell cat VERSION)
-REGISTRY    ?= ghcr.io/cheyo
+REGISTRY    ?= ghcr.io/OWNER
 
 IMAGE := $(REGISTRY)/$(PLUGIN_NAME):$(VERSION)
 
-.PHONY: all build test vet wasm image push clean help
+.PHONY: all build guards test vet wasm image push clean help
 
 all: build ## 等同于 build
 
-build: test vet wasm ## 测试 + vet + 编译 wasm
+build: guards test vet wasm ## 守卫 + 测试 + vet + 编译 wasm
+
+guards: ## 源码守卫：禁止覆盖式写日志属性
+	@# SetUserAttributeMap 在 SDK 里是【整体替换】不是合并（ctx.userAttribute = kvmap）。
+	@# 本插件的观测字段需要跨请求/响应阶段保留，一律用逐键的 SetUserAttribute。
+	@if grep -rnE '\.SetUserAttributeMap\(' --include='*.go' . ; then \
+		echo ""; \
+		echo "✗ 禁止使用 SetUserAttributeMap —— 它会整体替换属性表，请改用逐键 SetUserAttribute"; \
+		exit 1; \
+	fi
+	@echo "✓ guards passed"
 
 test: ## 跑单元测试
 	go test ./... -count=1

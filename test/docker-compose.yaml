@@ -1,0 +1,56 @@
+# 验证用的配套服务：Redis + 三个 LLM 上游桩
+#
+# 这里不包含 Higress 本身。Higress 请使用标准 Kubernetes + Helm 环境，
+# 本 compose 只提供生产验证手册附录里的 Redis 和 mock LLM 上游桩。
+#
+# 三个上游桩的分工：
+#   upstream-a  扮演「原模型」的上游（比如 gpt-4o 路由到这里）
+#   upstream-b  扮演「降级目标」的上游（比如 deepseek-v3 路由到这里）
+#   upstream-c  V3 专用：默认关着，需要时用 profile 拉起来当 fallback 目标
+#
+# 桩的响应里 model 字段写的是自己的身份（upstream-A / upstream-B），
+# 所以从客户端拿到的响应就能直接看出请求最终打到了谁 —— V1 就靠这个判定。
+#
+# 用法：
+#   docker compose up -d                      # 起 redis + a + b
+#   docker compose --profile v3 up -d         # 额外起 c（V3 用）
+#   curl localhost:18081/_requests            # 看 a 收到了什么
+#   curl localhost:18081/_reset               # 清空记录，开始下一轮
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: hbr-redis
+    ports: ["16379:6379"]
+    command: redis-server --save "" --appendonly no    # 纯内存，测试不需要持久化
+
+  upstream-a:
+    image: python:3.11-alpine
+    container_name: hbr-upstream-a
+    environment: { UPSTREAM_ID: "A", PORT: "8080" }
+    ports: ["18081:8080"]
+    volumes: ["./mock-upstream:/app:ro"]
+    command: ["python3", "/app/app.py"]
+
+  upstream-b:
+    image: python:3.11-alpine
+    container_name: hbr-upstream-b
+    environment: { UPSTREAM_ID: "B", PORT: "8080" }
+    ports: ["18082:8080"]
+    volumes: ["./mock-upstream:/app:ro"]
+    command: ["python3", "/app/app.py"]
+
+  # V3 专用：让 B 固定返回 503 触发 ai-proxy fallback 到 C，
+  # 再看插件按哪个模型计的费。需要时把 upstream-b 的 FORCE_STATUS 改成 503。
+  upstream-c:
+    image: python:3.11-alpine
+    container_name: hbr-upstream-c
+    profiles: ["v3"]
+    environment: { UPSTREAM_ID: "C", PORT: "8080" }
+    ports: ["18083:8080"]
+    volumes: ["./mock-upstream:/app:ro"]
+    command: ["python3", "/app/app.py"]
+
+networks:
+  default:
+    name: hbr-test

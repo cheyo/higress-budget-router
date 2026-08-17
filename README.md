@@ -1,12 +1,12 @@
 # higress-budget-router
 
-[![CI](https://github.com/cheyo/higress-budget-router/actions/workflows/ci.yml/badge.svg)](https://github.com/cheyo/higress-budget-router/actions/workflows/ci.yml)
+[![CI](https://github.com/OWNER/higress-budget-router/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/higress-budget-router/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.24-00ADD8.svg)](go.mod)
 
 **Budget-aware model degradation for the [Higress](https://higress.cn) AI Gateway — actively downgrade to a cheaper model *before* the request goes out, instead of blocking users with a 429 after the money is already spent.**
 
-[中文文档](README_zh-CN.md) · [Design doc (中文)](docs/design.md) · [Line-by-line walkthrough (中文)](docs/code-walkthrough.md)
+[中文文档](README_zh-CN.md) · **[User manual (中文)](docs/user-manual.md)** · [Production verification (中文)](docs/production-verification.md) · [Technical design (中文)](docs/technical-design.md)
 
 ---
 
@@ -56,7 +56,7 @@ spec:
 make build                    # go test + vet + wasm
 
 # 2. push the OCI image
-make push REGISTRY=ghcr.io/cheyo VERSION=0.1.0
+make push REGISTRY=ghcr.io/OWNER VERSION=0.1.0
 
 # 3. apply
 kubectl apply -f examples/basic.yaml
@@ -85,6 +85,12 @@ dry_run: true                   # start here — mark and log only, rewrite noth
 ```
 
 More scenarios in [`examples/`](examples/).
+
+## User-facing policy model
+
+`degrade_levels` is the central user-facing policy: it describes both when to downgrade and when to reject. `threshold` is the **remaining budget ratio**, not the used ratio; a level with `model` rewrites the request model, while a level with `reject: true` returns 429 without calling the upstream LLM.
+
+Budgets are tracked by `tenant + rule_name + budget_period`, not separately per model by default. `model_prices.input/output` are prices per million input/output tokens, and the real token counts come from the upstream response `usage` field. See the [user manual](docs/user-manual.md) for the full explanation.
 
 ## How it works
 
@@ -126,7 +132,10 @@ That is why the whole pipeline can use integer `INCRBY` instead of drift-prone `
 | `degrade_levels[].name` | string | `level-N` | shown in log attributes |
 | `degrade_levels[].threshold` | float | **required** | **remaining** ratio, [0,1] |
 | `degrade_levels[].model` | string | | target model; empty = mark only |
-| `degrade_levels[].reject` | bool | false | reject with `rejected_code` |
+| `degrade_levels[].reject` | bool | false | reject with `rejected_code`; must be the lowest threshold |
+| `degrade_levels[].max_request_bytes` | int | 0 (off) | skip degradation above this body size — calibrate from dry-run data, see [user manual §11](docs/user-manual.md#11-校准-max_request_bytes) |
+| `traffic_profile` | []string | - | capabilities this route's traffic uses: `tools`/`vision`/`audio`/`json_schema` |
+| `model_capabilities` | object | - | per-model capability table; validated **at config-apply time**, zero runtime cost |
 | `model_prices.<model>.input/output` | float | | per **million** tokens |
 | `default_price.input/output` | float | 1 / 1 | fallback for unknown models |
 | `model_key` | string | `model` | gjson path to the model field |
@@ -145,7 +154,7 @@ That is why the whole pipeline can use integer `INCRBY` instead of drift-prone `
 
 Written into the Higress AI access log (`wrapper.AILogKey`):
 
-`budget_tenant` · `budget_level` · `budget_remain_ratio` · `budget_original_model` · `budget_actual_model` · `budget_degraded` · `budget_cost_micro` · `budget_billed_mode`
+`budget_tenant` · `budget_level` · `budget_remain_ratio` · `budget_original_model` · `budget_actual_model` · `budget_degraded` · `budget_degrade_blocked_by` · `budget_request_bytes` · `budget_cost_micro` · `budget_billed_model`
 
 Dashboards worth building:
 
@@ -180,11 +189,19 @@ Eventually consistent, deliberately:
 - Go 1.24+ (`GOOS=wasip1 GOARCH=wasm`)
 - Redis reachable from the gateway and registered through `McpBridge`
 
-## Status & known issues
+## Status & limits
 
-**v0.1 — not yet production-hardened.** See [`docs/known-issues.md`](docs/known-issues.md) for a tracked list. The one to read first: requests with a non-JSON body (multipart audio/file uploads) are currently **not billed at all**, which biases the water level low.
+This project is ready for local and controlled-environment validation. Before production, run the [production verification guide](docs/production-verification.md) against your Higress version and target routing setup.
 
-Four points in [`docs/design.md`](docs/design.md) §10 should be verified in your own environment before going to production — most importantly whether rewriting the routing header in the *body* phase triggers Envoy route re-selection on your Higress version.
+Current limits:
+
+- Default coverage is chat/generation JSON paths: `/completions`, `/messages`, `/responses`, `/generateContent`.
+- Non-JSON, multipart, audio upload, embeddings, rerank, and moderation requests are not billed by the default policy.
+- Billing requires an upstream `usage` field.
+- Route re-selection after request-body-phase model rewrite must be verified in the target Higress environment.
+- Capability compatibility is enforced at config time through `traffic_profile` and `model_capabilities`; the plugin does not inspect request content at runtime.
+
+See [`docs/known-issues.md`](docs/known-issues.md) for the current limit list.
 
 ## License
 

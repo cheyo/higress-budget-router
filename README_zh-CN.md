@@ -1,12 +1,12 @@
 # higress-budget-router
 
-[![CI](https://github.com/cheyo/higress-budget-router/actions/workflows/ci.yml/badge.svg)](https://github.com/cheyo/higress-budget-router/actions/workflows/ci.yml)
+[![CI](https://github.com/OWNER/higress-budget-router/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/higress-budget-router/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.24-00ADD8.svg)](go.mod)
 
-**[Higress](https://higress.cn) AI 网关的预算感知降级插件 —— 在请求转发前依据实时预算水位主动切换至成本更低的模型，替代预算耗尽后以 429 拒绝请求的处置方式。**
+**[Higress](https://higress.cn) AI 网关的预算感知降级插件 —— 在请求发出之前主动切到更便宜的模型，而不是等钱花完了再用 429 把用户挡在门外。**
 
-[English](README.md) · [技术方案](docs/design.md) · [main.go 逐行解读](docs/code-walkthrough.md)
+[English](README.md) · **[用户手册](docs/user-manual.md)** · [生产验证](docs/production-verification.md) · [技术方案](docs/technical-design.md)
 
 ---
 
@@ -56,7 +56,7 @@ spec:
 make build                    # go test + vet + wasm 编译
 
 # 2. 推 OCI 镜像
-make push REGISTRY=ghcr.io/cheyo VERSION=0.1.0
+make push REGISTRY=ghcr.io/OWNER VERSION=0.1.0
 
 # 3. 部署
 kubectl apply -f examples/basic.yaml
@@ -85,6 +85,12 @@ dry_run: true                   # 从这里起步：只打标和记日志，不�
 ```
 
 更多场景见 [`examples/`](examples/)。
+
+## 用户必须理解的策略模型
+
+`degrade_levels` 是插件最核心的用户配置：它同时表达“什么时候降级”和“什么时候拒绝”。`threshold` 是**剩余预算比例**，不是已使用比例；命中带 `model` 的档位时插件会改写请求模型，命中 `reject: true` 的档位时插件会直接返回 429。
+
+预算按 `tenant + rule_name + budget_period` 统计，默认不是按模型单独统计。`model_prices.input/output` 是每百万输入 / 输出 token 的单价，真实 token 数来自上游响应里的 `usage` 字段。完整说明见 [用户手册](docs/user-manual.md)。
 
 ## 工作原理
 
@@ -126,7 +132,10 @@ inputTokens/1e6 × price_in 货币单位  ==  inputTokens × price_in 微单位
 | `degrade_levels[].name` | string | `level-N` | 出现在日志属性里 |
 | `degrade_levels[].threshold` | float | **必填** | **剩余**比例，[0,1] |
 | `degrade_levels[].model` | string | | 目标模型；空 = 只打标 |
-| `degrade_levels[].reject` | bool | false | 直接返回 `rejected_code` |
+| `degrade_levels[].reject` | bool | false | 直接返回 `rejected_code`。必须是 threshold 最小的一档 |
+| `degrade_levels[].max_request_bytes` | int | 0（不限） | 请求体超过此大小则不降级。**用 dry_run 数据校准**，见[用户手册 §11](docs/user-manual.md#11-校准-max_request_bytes) |
+| `traffic_profile` | []string | - | 声明本 route 会用到的能力：`tools`/`vision`/`audio`/`json_schema` |
+| `model_capabilities` | object | - | 各模型支持哪些能力。填了就在**配置生效时**校验降级目标，零运行时开销 |
 | `model_prices.<model>.input/output` | float | | 每**百万** Token 单价 |
 | `default_price.input/output` | float | 1 / 1 | 未知模型兜底 |
 | `model_key` | string | `model` | 模型字段的 gjson 路径 |
@@ -145,7 +154,7 @@ inputTokens/1e6 × price_in 货币单位  ==  inputTokens × price_in 微单位
 
 写入 Higress AI 访问日志（`wrapper.AILogKey`）：
 
-`budget_tenant` · `budget_level` · `budget_remain_ratio` · `budget_original_model` · `budget_actual_model` · `budget_degraded` · `budget_cost_micro` · `budget_billed_mode`
+`budget_tenant` · `budget_level` · `budget_remain_ratio` · `budget_original_model` · `budget_actual_model` · `budget_degraded` · `budget_degrade_blocked_by` · `budget_request_bytes` · `budget_cost_micro` · `budget_billed_model`
 
 值得建的看板：
 
@@ -180,11 +189,19 @@ inputTokens/1e6 × price_in 货币单位  ==  inputTokens × price_in 微单位
 - Go 1.24+（`GOOS=wasip1 GOARCH=wasm`）
 - 网关可达的 Redis，且已通过 `McpBridge` 注册
 
-## 状态与已知问题
+## 状态与当前限制
 
-**v0.1 —— 尚未经过生产打磨。** 完整清单见 [`docs/known-issues.md`](docs/known-issues.md)。最需要先看的一条：非 JSON 请求体（multipart 音频/文件上传）目前**完全不计费**，会让水位系统性偏低。
+当前版本适合本地和受控环境验证。生产使用前，请按照 [`docs/production-verification.md`](docs/production-verification.md) 在你的 Higress 版本和目标路由配置上完成验证。
 
-[`docs/design.md`](docs/design.md) §10 列了 4 个建议在你自己环境实测的点，最重要的是：在**请求体阶段**改写路由头能否在你的 Higress 版本上触发 Envoy 重新选路。
+当前限制：
+
+- 默认覆盖 chat/generation JSON 路径：`/completions`、`/messages`、`/responses`、`/generateContent`。
+- 非 JSON、multipart、音频上传、embeddings、rerank、moderations 请求默认不计费。
+- 计费依赖上游响应里的 `usage` 字段。
+- 请求体阶段改写模型和路由头后，是否能进入目标上游，需要在目标 Higress 环境中验证。
+- 能力兼容性通过 `traffic_profile` 和 `model_capabilities` 在配置期校验；插件运行时不检查请求内容。
+
+当前限制清单见 [`docs/known-issues.md`](docs/known-issues.md)。
 
 ## License
 
