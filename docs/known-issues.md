@@ -2,7 +2,49 @@
 
 逐行核对 `main.go` 时发现的问题清单。按严重程度排序。行号对应 v0.1 的 `main.go`。
 
-建议开源后把 §1 和 §4 转成 GitHub Issue 跟踪。
+建议开源后把 §0、§1 和 §4 转成 GitHub Issue 跟踪。
+
+---
+
+## 0. 【实测确认】请求体阶段改写路由头必定失败
+
+**位置**：`main.go` L244–L248
+
+这条原本挂在「待实测」清单里（见 [`design.md`](design.md) §10 第 1 条），
+2026-08-17 在 Higress all-in-one 2.1.0 + Envoy 上实测有了明确结论：**改不了，每次都失败**。
+
+网关日志（`/var/log/higress/gateway.log`，需先把 wasm 日志级别调到 debug）：
+
+```
+error … ai-budget-router: replace routing header x-higress-llm-model failed:
+        error status returned by host: bad argument
+```
+
+**根因**：`onHttpRequestBody` 执行时请求头早已流过 header filter chain，
+proxy-wasm 宿主此时不再接受 `ReplaceHttpRequestHeader`，直接返回 `BadArgument`。
+这不是 Higress 的版本差异，是 proxy-wasm ABI 的阶段约束。
+
+**影响分级**：
+
+- 模型改写本身**不受影响**——body 里的 `model` 字段照常被 sjson 改掉，
+  上游确实收到了降级后的模型（实测 mock 上游侧日志可见 `mock-chat-backup`）；
+- 只要下游按 **body 里的 model** 做协议转换（`ai-proxy` 就是这么做的），链路完全正常；
+- **但**如果不同模型配了**不同 Route / 不同上游服务**、且路由匹配依赖
+  `x-higress-llm-model` 这个头，那么降级后请求仍会走原模型的 Route——
+  body 改了、路由没改，两者不一致。
+
+**当前表现是"静默失败 + 一行 error 日志"**：L246 只记日志不中断，
+降级照常上报成功（`budget_degraded=true`），运维从日志属性上看不出路由头没改成。
+
+**修复方向**（三选一，按代价排序）：
+
+1. 认账：把 `model_to_header` 的默认值改成空串，文档里写明"本插件不改路由头"，
+   同时删掉 L244–L248 那段代码——避免每次降级都刷一条 error 日志；
+2. 提前到 header 阶段：在 `onHttpRequestHeaders` 里就完成决策与改头。
+   代价是拿不到 body 里的 model（只能依赖 `model-router` 写的头），
+   且 AUTHN 阶段的 `x-mse-consumer` 与 priority 排序要重新权衡；
+3. 至少让失败可见：改头失败时把 `budget_degraded` 或新增一个
+   `budget_header_rewrite_failed` 属性如实写进日志，别让它静默。
 
 ---
 
@@ -99,7 +141,7 @@ L149 的 `math.Max/Min` 对 NaN 无效（`math.Min(1, NaN)` 返回 NaN），NaN 
 
 见 [`design.md`](design.md) §10，摘要：
 
-1. **请求体阶段改写路由头能否触发 Envoy 重新选路** —— 最关键的一条。`model-router` 用的正是这个模式，但路由缓存的清除时机在不同 Higress 版本上需要实测，尤其当不同模型走**不同 Route/上游服务**时。若实测不生效，退路是把决策提到 AUTHN 阶段（priority > 900）在 header 阶段完成，代价是拿不到 `x-mse-consumer`。
+1. ~~请求体阶段改写路由头能否触发 Envoy 重新选路~~ —— **已实测，见上方 §0：改写调用本身就会失败**。
 2. 本插件（800）与 `ai-token-ratelimit`（600）的预算口径是否要打通。
 3. `ai-proxy` Fallback 触发后，响应体里是否会透传真实模型名。
 4. 高 QPS 下 Redis 连接池是否够用。

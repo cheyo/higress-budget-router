@@ -18,3 +18,8 @@ go.work.sum
 .DS_Store
 *.swp
 *~
+
+# 本地联调脚本的中间产物
+test/local/.setup.tmp/
+test/local/.wasmplugin.tmp.yaml
+test/local/mcpbridge.backup.yaml
