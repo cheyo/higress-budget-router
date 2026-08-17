@@ -1,4 +1,4 @@
-// Copyright (c) 2026 icheyo
+// Copyright (c) 2026 cheyo
 //
 // ai-budget-router：预算感知的主动降级路由插件
 //
